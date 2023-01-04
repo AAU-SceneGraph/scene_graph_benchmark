@@ -2,6 +2,7 @@
 
 import cv2
 import os.path as op
+import os
 import argparse
 import json
 import torch
@@ -66,10 +67,10 @@ def main():
     parser = argparse.ArgumentParser(description="Object Detection Demo")
     parser.add_argument("--config_file", metavar="FILE",
                         help="path to config file")
-    parser.add_argument("--img_file", metavar="FILE", help="image path")
+    parser.add_argument("--input", metavar="FILE", help="image path")
     parser.add_argument("--labelmap_file", metavar="FILE",
                         help="labelmap file to select classes for visualizatioin")
-    parser.add_argument("--save_file", required=False, type=str, default=None,
+    parser.add_argument("--output", required=False, type=str, default=None,
                         help="filename to save the proceed image")
     parser.add_argument("--device", default="cuda",
                         help="choose the device you want to work with")
@@ -97,8 +98,12 @@ def main():
     cfg.merge_from_list(args.opts)
     cfg.freeze()
 
-    assert op.isfile(args.img_file), \
-        "Image: {} does not exist".format(args.img_file)
+    if op.isfile(args.input):
+        img_files = [args.input]
+    else:
+        assert op.isdir(args.input), "Path: {} is neither an image nor a directory".format(args.input)
+        im_names = [im_path for im_path in os.listdir(args.input) if im_path[-3:]=="jpg"]
+        img_files = [f"{args.input}/{im_name}" for im_name in im_names]
 
     output_dir = cfg.OUTPUT_DIR
     mkdir(output_dir)
@@ -136,79 +141,90 @@ def main():
             int(val): key for key, val in
             dataset_allmap['predicate_to_idx'].items()}
 
-    transforms = build_transforms(cfg, is_train=False)
-    cv2_img = cv2.imread(args.img_file)
-    dets = detect_objects_on_single_image(model, transforms, cv2_img)
+    for i,img_file in enumerate(img_files):
+        print(f"Processing Image {i+1} of {len(img_files)}")
+        assert op.isfile(img_file), \
+            "Image: {} does not exist".format(img_file)
 
-    if isinstance(model, SceneParser):
-        rel_dets = dets['relations']
-        dets = dets['objects']
+        transforms = build_transforms(cfg, is_train=False)
+        cv2_img = cv2.imread(img_file)
+        dets = detect_objects_on_single_image(model, transforms, cv2_img)
 
-    for obj in dets:
-        obj["class"] = dataset_labelmap[obj["class"]]
-        obj["class"] = obj["class"].strip()
-    
-    if visual_labelmap is not None:
-        dets = [d for d in dets if d['class'] in visual_labelmap]
-    if cfg.MODEL.ATTRIBUTE_ON and args.visualize_attr:
+        if isinstance(model, SceneParser):
+            rel_dets = dets['relations']
+            dets = dets['objects']
+
         for obj in dets:
-            obj["attr"], obj["attr_conf"] = postprocess_attr(dataset_attr_labelmap, obj["attr"], obj["attr_conf"])
+            obj["class"] = dataset_labelmap[obj["class"]]
+            obj["class"] = obj["class"].strip()
+        
+        if visual_labelmap is not None:
+            dets = [d for d in dets if d['class'] in visual_labelmap]
+        if cfg.MODEL.ATTRIBUTE_ON and args.visualize_attr:
+            for obj in dets:
+                obj["attr"], obj["attr_conf"] = postprocess_attr(dataset_attr_labelmap, obj["attr"], obj["attr_conf"])
 
-    if cfg.MODEL.RELATION_ON and args.visualize_relation:
+        if cfg.MODEL.RELATION_ON and args.visualize_relation:
+            for rel in rel_dets:
+                rel['class'] = dataset_relation_labelmap[rel['class']]
+                subj_rect = dets[rel['subj_id']]['rect']
+                rel['subj_center'] = [(subj_rect[0]+subj_rect[2])/2, (subj_rect[1]+subj_rect[3])/2]
+                obj_rect = dets[rel['obj_id']]['rect']
+                rel['obj_center'] = [(obj_rect[0]+obj_rect[2])/2, (obj_rect[1]+obj_rect[3])/2]
+
+
+        rects = [d["rect"] for d in dets]
+        scores = [d["conf"] for d in dets]
+
+        if cfg.MODEL.ATTRIBUTE_ON and args.visualize_attr:
+            attr_labels = [','.join(d["attr"]) for d in dets]
+            attr_scores = [d["attr_conf"] for d in dets]
+            labels = [attr_label+' '+d["class"]
+                    for d, attr_label in zip(dets, attr_labels)]
+        else:
+            labels = [d["class"] for d in dets]
+
+        #draw_bb(cv2_img, rects, labels, scores)
+        
+        graph = {"frame":img_file,
+                "nodes":[],
+                "edges":[],
+                "lighthouse":[]
+            }
+
+        accepted_nodes = set()
+
+        for id,rect in enumerate(rects):
+            if scores[id] <= args.min_obj_score:
+                continue
+            accepted_nodes.add(id)
+            node = {"id": id, "bb": rect, "kg_mapping":[], "class": [labels[id].strip()], "confidence":[scores[id]], "expert": ["causal_tde"]}
+            graph["nodes"].append(node)
+
+        # merge(dets[rel['subj_id']]['rect'], dets[rel['obj_id']]['rect'])
+
         for rel in rel_dets:
-            rel['class'] = dataset_relation_labelmap[rel['class']]
-            subj_rect = dets[rel['subj_id']]['rect']
-            rel['subj_center'] = [(subj_rect[0]+subj_rect[2])/2, (subj_rect[1]+subj_rect[3])/2]
-            obj_rect = dets[rel['obj_id']]['rect']
-            rel['obj_center'] = [(obj_rect[0]+obj_rect[2])/2, (obj_rect[1]+obj_rect[3])/2]
+            if rel['conf'] <= args.min_rel_score:
+                continue
+            if rel["subj_id"] in accepted_nodes and rel["obj_id"] in accepted_nodes:
+                edge = {"source": rel["subj_id"], "dest": rel["obj_id"], "bb": [], "class": [rel["class"]], "confidence": [rel["conf"]], "expert": ["causal_tde"]}
+                graph["edges"].append(edge)
 
+        if not args.output:
+            output = op.splitext(img_file)[0] + ".SG.json"
+        else:
+            output = args.output
 
-    rects = [d["rect"] for d in dets]
-    scores = [d["conf"] for d in dets]
-
-    if cfg.MODEL.ATTRIBUTE_ON and args.visualize_attr:
-        attr_labels = [','.join(d["attr"]) for d in dets]
-        attr_scores = [d["attr_conf"] for d in dets]
-        labels = [attr_label+' '+d["class"]
-                  for d, attr_label in zip(dets, attr_labels)]
-    else:
-        labels = [d["class"] for d in dets]
-
-    #draw_bb(cv2_img, rects, labels, scores)
-    
-    graph = {"frame":args.img_file,
-             "nodes":[],
-             "edges":[],
-             "lighthouse":[]
-	    }
-
-    accepted_nodes = set()
-
-    for id,rect in enumerate(rects):
-        if scores[id] <= args.min_obj_score:
-            continue
-        accepted_nodes.add(id)
-        node = {"id": id, "bb": rect, "kg_mapping":[], "class": [labels[id].strip()], "confidence":[scores[id]], "expert": ["causal_tde"]}
-        graph["nodes"].append(node)
-
-    # merge(dets[rel['subj_id']]['rect'], dets[rel['obj_id']]['rect'])
-
-    for rel in rel_dets:
-        if rel['conf'] <= args.min_rel_score:
-            continue
-        if rel["subj_id"] in accepted_nodes and rel["obj_id"] in accepted_nodes:
-             edge = {"source": rel["subj_id"], "dest": rel["obj_id"], "bb": [], "class": [rel["class"]], "confidence": [rel["conf"]], "expert": ["causal_tde"]}
-             graph["edges"].append(edge)
-
-    if not args.save_file:
-        save_file = op.splitext(args.img_file)[0] + ".causal_tde.json"
-    else:
-        save_file = args.save_file
-    print("save results to: {}".format(save_file))
-
-    # save results in json format
-    with open(save_file, 'w') as f:
-        json.dump(graph, f, indent=4)
+        if op.isfile(args.input):
+            print("save results to: {}".format(output))
+            # save results in json format
+            with open(output, 'w') as f:
+                json.dump(graph, f, indent=4)
+        else:
+            assert op.isdir(args.output), f"{args.output} is not a directory"
+            json_name = im_names[i][:-3] + "SG.json"
+            with open(f"{args.output}/{json_name}", 'w') as f:
+                json.dump(graph, f, indent=4)
 
 
 if __name__ == "__main__":

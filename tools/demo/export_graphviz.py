@@ -121,7 +121,7 @@ def sg_to_graphviz(sg_json, out_path=None):
     dot = to_pydot(G).to_string()
     skg = Source(dot) # dot is string containing DOT notation of graph
     if not out_path:
-        skg.render(sg_json.replace(".causal_tde.json","_graph"), view=False, cleanup=True, format='pdf')
+        skg.render(sg_json.replace(".SG.json","_graph"), view=False, cleanup=True, format='pdf')
     else:
         skg.render(out_path, view=False, cleanup=True, format='pdf')
 
